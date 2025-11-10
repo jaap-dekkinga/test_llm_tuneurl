@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>TuneURL ONNX Audio Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/meyda/dist/web/meyda.min.js"></script>
+</head>
+<body>
+  <h2>TuneURL Audio Classification Test</h2>
+
+  <p>1. Upload ONNX Model: <input type="file" id="onnxFile"  accept=".onnx"></p>
+  <p>2. Upload Scaler JSON: <input type="file" id="scalerFile"  accept=".json"></p>
+  <p>3. Upload WAV File: <input type="file" id="audioFile"  accept=".wav"></p>
+  <button onclick="runTest()">Run Test</button>
+
+  <h3>Result:</h3>
+  <pre id="output"></pre>
+
+<script>
+let session = null;
+let scaler = null;
+
+// Load ONNX
+document.getElementById('onnxFile').addEventListener('change', async (e) => {
+  const buf = await e.target.files[0].arrayBuffer();
+  session = await ort.InferenceSession.create(buf);
+  document.getElementById('output').textContent = "ONNX model loaded.";
+});
+
+// Load Scaler
+document.getElementById('scalerFile').addEventListener('change', async (e) => {
+  const text = await e.target.files[0].text();
+  scaler = JSON.parse(text);
+  document.getElementById('output').textContent = "Scaler loaded with " + scaler.mean.length + " features.";
+});
+
+// === Real MFCC Extraction using Meyda ===
+async function extractFeatures(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  const audioCtx = new AudioContext();
+  const audioBuf = await audioCtx.decodeAudioData(arrayBuffer);
+  const channelData = audioBuf.getChannelData(0); // mono
+
+  // Meyda requires frames — process in sliding windows
+  const frameSize = 1024;
+  const hopSize = 512;
+  let mfccs = [];
+
+  for (let i = 0; i + frameSize < channelData.length; i += hopSize) {
+    const frame = channelData.slice(i, i + frameSize);
+    const mfcc = Meyda.extract("mfcc", frame, {
+      bufferSize: frameSize,
+      sampleRate: audioCtx.sampleRate,
+      melBands: 40, // adjust if needed
+      numberOfMFCCCoefficients: 20
+    });
+    if (mfcc) mfccs.push(mfcc);
+  }
+
+  // Mean pool across frames
+  let mfccMean = new Array(mfccs[0].length).fill(0);
+  for (let row of mfccs) {
+    row.forEach((val, j) => { mfccMean[j] += val; });
+  }
+  mfccMean = mfccMean.map(v => v / mfccs.length);
+
+  // Pad/truncate to scaler length
+  const features = new Array(scaler.mean.length).fill(0);
+  for (let j = 0; j < Math.min(mfccMean.length, features.length); j++) {
+    features[j] = mfccMean[j];
+  }
+
+  return features;
+}
+
+// Normalize
+function normalize(features) {
+  return features.map((v,i) => (v - scaler.mean[i]) / scaler.scale[i]);
+}
+
+// Run Inference
+async function runTest() {
+  if (!session || !scaler) {
+    alert("Please load ONNX and scaler first.");
+    return;
+  }
+  const file = document.getElementById('audioFile').files[0];
+  if (!file) { alert("Upload an audio file."); return; }
+
+  let feats = await extractFeatures(file);
+  let normFeats = normalize(feats);
+
+  const input = new ort.Tensor('float32', Float32Array.from(normFeats), [1, normFeats.length]);
+  const results = await session.run({ input });
+  const output = results[Object.keys(results)[0]].data;
+
+  const probTrue = output[0];
+  const classification = probTrue > 0.28 ? "TRUE (TuneURL)" : "FALSE (Not TuneURL)";
+
+  document.getElementById('output').textContent =
+    `Raw output: ${output}\nClassification: ${classification}\nProb=True: ${probTrue.toFixed(3)}`;
+}
+</script>
+</body>
+</html>
